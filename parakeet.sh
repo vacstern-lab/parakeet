@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Универсальный скрипт оптимизации и развертывания Mikan (Ubuntu 24.04 / Debian 12)
+# Mikan VPN: Setup & Hardening (Fixed TTY input)
 # ==============================================================================
 
 set -e
@@ -12,17 +12,16 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}Ошибка: запустите скрипт от root (sudo bash $0)${NC}"
+   echo -e "${RED}Ошибка: запустите от root (sudo bash $0)${NC}"
    exit 1
 fi
 
 apply_optimizations() {
-    echo -e "${BLUE}=== 1. Очистка и установка базовых утилит ===${NC}"
-    apt-get update -y
-    apt-get install -y curl wget jq ufw zram-tools ca-certificates gnupg lsb-release
+    echo -e "${BLUE}=== 1. Установка пакетов ===${NC}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget jq ufw zram-tools ca-certificates
 
-    echo -e "${BLUE}=== 2. Настройка zRAM (экономим диск, расширяем RAM) ===${NC}"
-    # Вместо swapfile на 5GB SSD используем сжатую память в RAM
+    echo -e "${BLUE}=== 2. Настройка zRAM (сжатие в RAM, экономим 5GB SSD) ===${NC}"
     cat <<EOF > /etc/default/zramswap
 ALGO=zstd
 PERCENT=50
@@ -30,7 +29,7 @@ PRIORITY=100
 EOF
     systemctl restart zramswap 2>/dev/null || true
 
-    echo -e "${BLUE}=== 3. Жесткое урезание логов Journald ===${NC}"
+    echo -e "${BLUE}=== 3. Ограничение системных логов Journald до 30MB ===${NC}"
     mkdir -p /etc/systemd/journald.conf.d/
     cat <<EOF > /etc/systemd/journald.conf.d/low-disk.conf
 [Journal]
@@ -43,12 +42,11 @@ EOF
     systemctl restart systemd-journald
     journalctl --vacuum-size=30M >/dev/null 2>&1 || true
 
-    echo -e "${BLUE}=== 4. Ограничение логов Docker ===${NC}"
+    echo -e "${BLUE}=== 4. Ограничение логов Docker (макс 2 файла по 5MB) ===${NC}"
     mkdir -p /etc/docker
     if [ -f /etc/docker/daemon.json ]; then
-        # Обновляем существующий json
         TMP_JSON=$(mktemp)
-        jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "5m", "max-file": "2"}}' /etc/docker/daemon.json > "$TMP_JSON" && mv "$TMP_JSON" /etc/docker/daemon.json
+        jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "5m", "max-file": "2"}}' /etc/docker/daemon.json > "$TMP_JSON" 2>/dev/null && mv "$TMP_JSON" /etc/docker/daemon.json || true
     else
         cat <<EOF > /etc/docker/daemon.json
 {
@@ -61,13 +59,10 @@ EOF
 EOF
     fi
 
-    echo -e "${BLUE}=== 5. Настройка BBR и TCP тюнинг ===${NC}"
+    echo -e "${BLUE}=== 5. Настройка BBR и сети ===${NC}"
     cat <<EOF > /etc/sysctl.d/99-vpn-tuning.conf
-# Включение BBR
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
-# Защита от SYN флуда и сетевой стек
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 4096
 net.core.somaxconn = 8192
@@ -75,14 +70,12 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
-
-# Экономия памяти
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 EOF
-    sysctl --system >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1 || true
 
-    echo -e "${BLUE}=== 6. Создание автоочистки по крону ===${NC}"
+    echo -e "${BLUE}=== 6. Автоочистка диска по cron ===${NC}"
     cat <<'EOF' > /etc/cron.daily/disk-cleaner
 #!/bin/bash
 journalctl --vacuum-size=25M >/dev/null 2>&1
@@ -95,24 +88,22 @@ fi
 EOF
     chmod +x /etc/cron.daily/disk-cleaner
 
-    echo -e "${BLUE}=== 7. Базовая безопасность (UFW) ===${NC}"
-    # Открываем SSH, чтобы не потерять доступ
-    SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
+    echo -e "${BLUE}=== 7. Настройка файрвола (UFW) ===${NC}"
+    SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -n1)
     SSH_PORT=${SSH_PORT:-22}
-    ufw allow "$SSH_PORT"/tcp comment 'SSH'
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS'
-    ufw allow 443/udp comment 'QUIC/Hysteria'
-    # Открываем диапазон для возможных протоколов VPN
-    ufw allow 10000:65000/tcp comment 'VPN Dynamic Range TCP'
-    ufw allow 10000:65000/udp comment 'VPN Dynamic Range UDP'
-    echo "y" | ufw enable
+    ufw allow "$SSH_PORT"/tcp comment 'SSH' >/dev/null 2>&1 || true
+    ufw allow 80/tcp comment 'HTTP' >/dev/null 2>&1 || true
+    ufw allow 443/tcp comment 'HTTPS' >/dev/null 2>&1 || true
+    ufw allow 443/udp comment 'QUIC' >/dev/null 2>&1 || true
+    ufw allow 10000:65000/tcp comment 'VPN TCP' >/dev/null 2>&1 || true
+    ufw allow 10000:65000/udp comment 'VPN UDP' >/dev/null 2>&1 || true
+    echo "y" | ufw enable >/dev/null 2>&1 || true
 
-    echo -e "${GREEN}✓ Система оптимизирована! Диск защищен от переполнения логами.${NC}"
+    echo -e "${GREEN}✓ Оптимизация завершена. Логи урезаны, zRAM включен.${NC}"
 }
 
 clean_disk_now() {
-    echo -e "${YELLOW}Очищаем диск прямо сейчас...${NC}"
+    echo -e "${YELLOW}Очистка диска...${NC}"
     apt-get clean
     apt-get autoremove -y
     journalctl --vacuum-size=10M
@@ -123,35 +114,48 @@ clean_disk_now() {
     df -h /
 }
 
-# ----------------- Меню -----------------
-echo -e "${GREEN}=====================================${NC}"
-echo -e "${GREEN}  Mikan VPN: Setup & Hardening Menu  ${NC}"
-echo -e "${GREEN}=====================================${NC}"
-echo "1) Выполнить оптимизацию диска/памяти/сети (ОБЯЗАТЕЛЬНО для обоих)"
-echo "2) [МОСКВА] Установить основную Mikan Panel"
-echo "3) [ФИНЛЯНДИЯ] Подключить как Ноду (Join Node)"
-echo "4) Экстренно очистить диск прямо сейчас"
-echo "5) Выход"
-echo -n "Выберите действие [1-5]: "
-read -r CHOICE
+# Если передали аргумент при запуске (например: bash setup.sh 2)
+CHOICE="$1"
 
-case $CHOICE in
+if [[ -z "$CHOICE" ]]; then
+    echo -e "${GREEN}=====================================${NC}"
+    echo -e "${GREEN}  Mikan VPN: Setup & Hardening Menu  ${NC}"
+    echo -e "${GREEN}=====================================${NC}"
+    echo "1) Выполнить только оптимизацию (диск/zRAM/BBR)"
+    echo "2) [МОСКВА] Установить основную Mikan Panel"
+    echo "3) [ФИНЛЯНДИЯ] Подключить как Ноду (Join Node)"
+    echo "4) Экстренно очистить диск прямо сейчас"
+    echo "5) Выход"
+    echo -ne "${YELLOW}Выберите действие [1-5]: ${NC}"
+    # Читаем строго из tty терминала, чтобы не скипалось
+    read -r CHOICE < /dev/tty
+fi
+
+# Убираем возможные пробелы и символы \r
+CHOICE=$(echo "$CHOICE" | tr -d '\r' | xargs)
+
+case "$CHOICE" in
     1)
         apply_optimizations
         ;;
     2)
         apply_optimizations
-        echo -e "${YELLOW}Запуск официального установщика Mikan Panel...${NC}"
+        echo -e "${YELLOW}Запуск официального инсталлятора Mikan Panel...${NC}"
         curl -fsSL https://github.com/Miroshka000/mikan/releases/latest/download/install.sh | bash
         ;;
     3)
         apply_optimizations
-        echo -n "Вставьте команду/ключ подключения из панели Mikan (или параметр --join KEY): "
-        read -r JOIN_KEY
+        JOIN_KEY="$2"
         if [[ -z "$JOIN_KEY" ]]; then
-            echo -e "${RED}Ключ не может быть пустым!${NC}"
+            echo -ne "${YELLOW}Вставьте ключ или команду подключения из панели: ${NC}"
+            read -r JOIN_KEY < /dev/tty
+        fi
+
+        if [[ -z "$JOIN_KEY" ]]; then
+            echo -e "${RED}Ошибка: ключ пустой!${NC}"
             exit 1
         fi
+
         echo -e "${YELLOW}Подключение ноды...${NC}"
         if [[ "$JOIN_KEY" =~ "install.sh" ]]; then
             eval "$JOIN_KEY"
@@ -166,6 +170,7 @@ case $CHOICE in
         exit 0
         ;;
     *)
-        echo -e "${RED}Неверный пункт!${NC}"
+        echo -e "${RED}Неверный пункт: '$CHOICE'${NC}"
+        exit 1
         ;;
 esac
