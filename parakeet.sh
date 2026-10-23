@@ -6,11 +6,6 @@
 
 set -euo pipefail
 
-# Перенаправляем стандартный ввод на терминал для корректной работы через curl | bash
-if [[ -t 0 ]] || [[ -e /dev/tty ]]; then
-    exec < /dev/tty
-fi
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -49,12 +44,10 @@ unlock_apt() {
 apply_optimizations() {
     unlock_apt
 
-    # Определяем общий размер корневого диска в ГБ
     DISK_TOTAL_GB=$(df -BG / | awk 'NR==2 {gsub("G","",$2); print $2}')
     echo -e "${GREEN}Обнаружен диск: ~${DISK_TOTAL_GB} ГБ${NC}"
 
     echo -e "${BLUE}=== [2/8] Установка системных утилит и защиты ===${NC}"
-    # Если диск маленький (<= 7 ГБ), отключаем кэширование пакетов apt
     if (( DISK_TOTAL_GB <= 7 )); then
         cat <<EOF > /etc/apt/apt.conf.d/99-no-cache
 Dir::Cache "";
@@ -76,7 +69,6 @@ PRIORITY=100
 EOF
     systemctl restart zramswap 2>/dev/null || true
 
-    # Если диск больше 10 ГБ (Москва 20GB SAS) — создаем страховочный swapfile на 1 ГБ
     if (( DISK_TOTAL_GB >= 10 )); then
         if [[ ! -f /swapfile ]]; then
             echo -e "${YELLOW}Диск позволяет (>10 ГБ): создаем страховочный /swapfile на 1 ГБ...${NC}"
@@ -122,13 +114,10 @@ EOF
 
     echo -e "${BLUE}=== [6/8] Тюнинг ядра: BBR, сеть под 1 vCPU / 768M и защита от атак ===${NC}"
     cat <<EOF > /etc/sysctl.d/99-vpn-hardening.conf
-# Ускорение TCP и BBR
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
-
-# Оптимизация очередей и буферов под 768 МБ ОЗУ
 net.ipv4.tcp_max_syn_backlog = 4096
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 4096
@@ -136,12 +125,8 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.ip_local_port_range = 10240 65535
-
-# Маршрутизация VPN
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
-
-# Сетевая безопасность (Hardening)
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.conf.all.rp_filter = 1
@@ -156,8 +141,6 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
-
-# Память и кеширование дисков (снижение износа SSD и задержек SAS)
 vm.swappiness = 80
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 15
@@ -170,7 +153,6 @@ EOF
     SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | awk -F: '{print $NF}' | head -n1)
     SSH_PORT=${SSH_PORT:-22}
 
-    # Конфигурация Fail2ban
     cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime = 24h
@@ -185,7 +167,6 @@ EOF
     systemctl enable --now fail2ban >/dev/null 2>&1 || true
     systemctl restart fail2ban >/dev/null 2>&1 || true
 
-    # Настройка UFW
     ufw default deny incoming >/dev/null 2>&1 || true
     ufw default allow outgoing >/dev/null 2>&1 || true
     ufw limit "$SSH_PORT"/tcp comment 'SSH Rate Limit' >/dev/null 2>&1 || true
@@ -209,7 +190,6 @@ fi
 EOF
     chmod +x /etc/cron.daily/disk-cleaner
 
-    # Очищаем списки пакетов сразу, если мы на 5 ГБ SSD
     if (( DISK_TOTAL_GB <= 7 )); then
         apt-get clean >/dev/null 2>&1
         rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
@@ -240,11 +220,11 @@ install_mikan_panel() {
     tmp_installer=$(mktemp /tmp/mikan_install.XXXXXX.sh)
     curl -fsSL https://github.com/Miroshka000/mikan/releases/latest/download/install.sh -o "$tmp_installer"
     chmod +x "$tmp_installer"
-    bash "$tmp_installer" "$@"
+    # Подключаем клавиатуру строго к дочернему скрипту
+    bash "$tmp_installer" "$@" < /dev/tty
     rm -f "$tmp_installer"
 }
 
-# Чтение аргумента командной строки (если передан)
 CHOICE="${1:-}"
 
 if [[ -z "$CHOICE" ]]; then
@@ -257,7 +237,7 @@ if [[ -z "$CHOICE" ]]; then
     echo "4) Экстренно очистить диск прямо сейчас"
     echo "5) Выход"
     echo -ne "${YELLOW}Выберите действие [1-5]: ${NC}"
-    read -r CHOICE
+    read -r CHOICE < /dev/tty
 fi
 
 CHOICE=$(echo "$CHOICE" | tr -d '\r' | xargs)
@@ -275,7 +255,7 @@ case "$CHOICE" in
         JOIN_KEY="${2:-}"
         if [[ -z "$JOIN_KEY" ]]; then
             echo -ne "${YELLOW}Вставьте ключ или команду подключения из панели: ${NC}"
-            read -r JOIN_KEY
+            read -r JOIN_KEY < /dev/tty
         fi
 
         if [[ -z "$JOIN_KEY" ]]; then
@@ -285,7 +265,7 @@ case "$CHOICE" in
 
         echo -e "${YELLOW}Подключение ноды...${NC}"
         if [[ "$JOIN_KEY" =~ "install.sh" ]]; then
-            eval "$JOIN_KEY"
+            eval "$JOIN_KEY" < /dev/tty
         else
             install_mikan_panel --join "$JOIN_KEY"
         fi
